@@ -1,12 +1,15 @@
 #include <iostream>
 #include <memory>
 #include <string>
-
+//#include <boost/compute.hpp>
 #include <fstream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <chrono>
+#include <ctime>
+#include <iomanip>
 typedef std::chrono::high_resolution_clock Clock;
+typedef std::chrono::system_clock SClock;
 
 #include "xcl2.hpp"
 #include <vector>
@@ -15,6 +18,9 @@ typedef std::chrono::high_resolution_clock Clock;
 #include "grpc_service.grpc.pb.h"
 #include "request_status.grpc.pb.h"
 #include "model_config.pb.h"
+
+#define NBUFFER 4
+#define NUM_CU 1
 
 #include "kernel_params.h"
 
@@ -36,27 +42,84 @@ class GRPCServiceImplementation final : public nvidia::inferenceserver::GRPCServ
  public:
   std::vector<bigdata_t,aligned_allocator<bigdata_t>> source_in;
   std::vector<bigdata_t,aligned_allocator<bigdata_t>> source_hw_results;
-//(DATA_SIZE_IN*STREAMSIZE);
-//(DATA_SIZE_OUT*STREAMSIZE);
-  std::vector<cl::Memory> inBufVec, outBufVec;
-  cl::Kernel krnl_xil;
   cl::Program program;
-  cl::CommandQueue q;
+  std::vector<cl::CommandQueue> q;
+  std::vector<cl::Kernel> krnl_xil;
+  int ikern;
+  std::vector<bool> isFirstRun;
+  std::vector<std::vector<cl::Event>>   writeList;
+  std::vector<std::vector<cl::Event>>   kernList;
+  std::vector<std::vector<cl::Event>>   readList;
+  std::vector<cl::Buffer> buffer_in;
+  std::vector<cl::Buffer> buffer_out;
+  std::vector<cl::Event>   write_event;
+  std::vector<cl::Event>   kern_event;
+  //std::vector<cl::Event>   read_event;
+  std::mutex mtx;
+  std::mutex mtxi_write[NUM_CU*NBUFFER];
 
- private: 
-  std::vector<cl::Event>   waitInput_;//m_Mem2FpgaEvents;                                                                                                                                                                                 
-  std::vector<cl::Event>   waitOutput_;//m_ExeKernelEvents;                                                                                                                                                                               
+  std::pair<int,bool> get_info_lock() {
+    int i;
+    bool first;
+    mtx.lock();
+    i = ikern++;
+    first = isFirstRun[i];
+    if (first) isFirstRun[i]=false;
+    if (ikern==NUM_CU*NBUFFER) ikern=0;
+    mtx.unlock();
+    return std::make_pair(i,first);
+  }
+  void get_ilock_write(int ik) {
+    mtxi_write[ik].lock();
+  }
+  void release_ilock_write(int ik) {
+    mtxi_write[ik].unlock();
+  }
+
+ private:
+
+  cl_int err;
+
+  void print_nanoseconds(std::string prefix, std::chrono::time_point<std::chrono::system_clock> now, int ik) {
+    auto duration = now.time_since_epoch();
+    
+    typedef std::chrono::duration<int, std::ratio_multiply<std::chrono::hours::period, std::ratio<8>
+    >::type> Days; /* UTC: +8:00 */
+    
+    Days days = std::chrono::duration_cast<Days>(duration);
+        duration -= days;
+    auto hours = std::chrono::duration_cast<std::chrono::hours>(duration);
+        duration -= hours;
+    auto minutes = std::chrono::duration_cast<std::chrono::minutes>(duration);
+        duration -= minutes;
+    auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
+        duration -= seconds;
+    auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(duration);
+        duration -= milliseconds;
+    auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(duration);
+        duration -= microseconds;
+    auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(duration);
+
+    std::cout << "KERN" << ik << ", " << prefix << hours.count() << ":"
+          << minutes.count() << ":"
+          << seconds.count() << ":"
+          << milliseconds.count() << ":"
+          << microseconds.count() << ":"
+          << nanoseconds.count() << std::endl;
+  }
 
   grpc::Status Status(
 		     ServerContext* context, 
 		     const StatusRequest* request, 
 		     StatusResponse* reply
 		     ) override {
+
+    //std::cout << "In Status" << std::endl;
     auto server_status = reply->mutable_server_status();
     server_status->set_id("inference:0");
     auto& model_status  = *server_status->mutable_model_status();
     auto config = model_status["facile"].mutable_config();
-    config->set_max_batch_size(160000);
+    config->set_max_batch_size(1600000);
     //Hcal config
     config->set_name("facile");
     auto input = config->add_input();
@@ -79,11 +142,20 @@ class GRPCServiceImplementation final : public nvidia::inferenceserver::GRPCServ
 		     InferResponse* reply
 		     ) override {
     auto t0 = Clock::now();
+    auto ikf = get_info_lock();
+    int ikb = ikf.first;
+    int ik = ikb%NUM_CU;
+    bool firstRun = ikf.second;
+    //std::cout<<"Running kernel "<<ik<<"... first run? ("<<firstRun<<")"<<std::endl;
+    auto ts1_ = SClock::now();
+    //print_nanoseconds("   in Infer  ",ts1_, ikb);
+    //std::cout<<request->meta_data().batch_size()<<std::endl;
     const std::string& raw = request->raw_input(0);
     const void* lVals = raw.c_str();
     data_t* lFVals = (data_t*) lVals;
-    //output array that is equal to ninputs(15)*batch flot is 4 bits
+    //output array that is equal to ninputs(15)*batch flot is 4 bytes
     unsigned batch_size = raw.size()/32/sizeof(data_t);
+    //std::cout<<raw.size()<<std::endl;
     reply->mutable_request_status()->set_code(RequestStatusCode::SUCCESS);
     reply->mutable_request_status()->set_server_id("inference:0");
     reply->mutable_meta_data()->set_id(request->meta_data().id());
@@ -94,41 +166,74 @@ class GRPCServiceImplementation final : public nvidia::inferenceserver::GRPCServ
     auto output1 = reply->mutable_meta_data()->add_output();
     output1->set_name("output/BiasAdd");
     output1->mutable_raw()->mutable_dims()->Add(1);
-    output1->mutable_raw()->set_batch_byte_size(2*sizeof(data_t)*batch_size);
+    output1->mutable_raw()->set_batch_byte_size(sizeof(data_t)*batch_size);
 
-    memcpy(source_in.data(), &lFVals[0], batch_size*sizeof(bigdata_t));
-    //auto t1 = Clock::now();
-    //auto t1a = Clock::now();
-    //cl::Event l_event_in;                                                                                                                                                                                                                  
-    //q.enqueueMigrateMemObjects(inBufVec,0/* 0 means from host*/,NULL,&l_event_in);                                                                                                                                                         
-    q.enqueueMigrateMemObjects(inBufVec,0/* 0 means from host*/);
-    //waitInput_.push_back(l_event_in);
-    //auto t1b = Clock::now();
-    //cl::Event l_event;                                                                                                                                                                                                                  
-    //q.enqueueTask(krnl_xil,&(waitInput_),&l_event);  
-    //waitOutput_.push_back(l_event);
-    q.enqueueTask(krnl_xil);
-    //auto t1c = Clock::now();
-    cl::Event l_event_out;                                                                                                                                                                                                                 
-    //q.enqueueMigrateMemObjects(outBufVec,CL_MIGRATE_MEM_OBJECT_HOST,&waitOutput_,&l_event_out);  
-    q.enqueueMigrateMemObjects(outBufVec,CL_MIGRATE_MEM_OBJECT_HOST);
-    q.finish();
-    //l_event_out.wait();
-    //clFinish(q.get());
-    //auto t2 = Clock::now();
+    auto ts1p = SClock::now();
+    //print_nanoseconds("   pre-lock  ",ts1p, ikb);
+    get_ilock_write(ikb);
+    auto ts1 = SClock::now();
+    //print_nanoseconds("       start:   ",ts1, ik);
+    memcpy(source_in.data()+ikb*STREAMSIZE, &lFVals[0], batch_size*sizeof(bigdata_t));
+    auto t1 = Clock::now();
+    auto ts1a = SClock::now();
+    //print_nanoseconds("   memcpy  ",ts1a, ikb);
+    if (!firstRun) {
+        OCL_CHECK(err, err = kern_event[ikb].wait());
+    }
+    auto ts1b = SClock::now();
+    //print_nanoseconds("   kernwait  ",ts1b, ikb);
+    OCL_CHECK(err,
+              err =
+                  q[ik].enqueueMigrateMemObjects({buffer_in[ikb]},
+                                             0 /* 0 means from host*/,
+                                             NULL,
+                                             &(write_event[ikb])));
+    auto ts1c = SClock::now();
+   // print_nanoseconds("       write:   ",ts1c, ik);
+    
+    writeList[ikb].clear();
+    writeList[ikb].push_back(write_event[ikb]);
+    //Launch the kernel
+    OCL_CHECK(err,
+              err = q[ik].enqueueNDRangeKernel(
+                  krnl_xil[ikb], 0, 1, 1, &(writeList[ikb]), &(kern_event[ikb])));
+    auto ts1d = SClock::now();
+    //print_nanoseconds("      kernel:   ",ts1d, ik);
+    kernList[ikb].clear();
+    kernList[ikb].push_back(kern_event[ikb]);
+    cl::Event read_event;
+    OCL_CHECK(err,
+              err = q[ik].enqueueMigrateMemObjects({buffer_out[ikb]},
+                                               CL_MIGRATE_MEM_OBJECT_HOST,
+                                               &(kernList[ikb]),
+                                               &(read_event)));
+    auto ts1e = SClock::now();
+    //print_nanoseconds("        read:   ",ts1e, ik);
 
+    release_ilock_write(ikb);
+    OCL_CHECK(err, err = kern_event[ikb].wait());
+    OCL_CHECK(err, err = read_event.wait());
+    auto ts1f = SClock::now();
+    //print_nanoseconds("   readwait  ",ts1f, ikb);
+    auto t2 = Clock::now();
+    auto ts2 = SClock::now();
+    //print_nanoseconds("       finish:  ",ts2, ik);
+    //std::cout << " FPGA time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count() << " ns" << std::endl;
+
+    //Finally deal with the ouputs
     std::string *outputs1 = reply->add_raw_output();
-    char* lTVals = new char[batch_size*sizeof(data_t)];//2*batch_size*sizeof(data_t)];
-    memcpy(&lTVals[0], source_hw_results.data(), batch_size*sizeof(data_t));
+    char* lTVals = new char[batch_size*sizeof(data_t)];
+    memcpy(&lTVals[0], source_hw_results.data()+(ikb*COMPSTREAMSIZE), (batch_size)*sizeof(data_t));
     outputs1->append(lTVals,(batch_size)*sizeof(data_t));
+    auto ts1g = SClock::now();
+    //print_nanoseconds("   finish  ",ts1g, ikb);
+
     auto t3 = Clock::now();
-    //std::cout << "Total time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(t3  - t0).count() << " ns" << std::endl;
-    //std::cout << "   T1 time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(t1  - t0).count() << " ns" << std::endl;
-    //std::cout << "   T2 time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(t3  - t2).count() << " ns" << std::endl;
-    //std::cout << " FPGA time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(t2  - t1a).count() << " ns" << std::endl;
-    //std::cout << " FPGA time: t1  " << std::chrono::duration_cast<std::chrono::nanoseconds>(t1b - t1a).count() << " ns" << std::endl;
-    //std::cout << " FPGA time: inf " << std::chrono::duration_cast<std::chrono::nanoseconds>(t1c - t1b).count() << " ns" << std::endl;
-    //std::cout << " FPGA time: t2  " << std::chrono::duration_cast<std::chrono::nanoseconds>(t2  - t1c).count() << " ns" << std::endl;
+    //std::cout << "Total time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t0).count() << " ns" << std::endl;
+    //std::cout << "   T1 time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count() << " ns" << std::endl;
+    //std::cout << "   T2 time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count() << " ns" << std::endl;
+    //std::cout << " FPGA time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count() << " ns" << std::endl;
+
     return grpc::Status::OK;
   } 
 };
@@ -137,55 +242,105 @@ void Run(std::string xclbinFilename) {
   std::string address("0.0.0.0:8443");
   GRPCServiceImplementation service;
 
+  ServerBuilder builder;
+  builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+  builder.SetMaxMessageSize(10000000);
+  builder.RegisterService(&service);
+  //All the crap that trt inference server runs
+  //std::unique_ptr<grpc::ServerCompletionQueue> health_cq = builder.AddCompletionQueue();
+  //std::unique_ptr<grpc::ServerCompletionQueue> status_cq = builder.AddCompletionQueue();
+  //std::unique_ptr<grpc::ServerCompletionQueue> repository_cq   = builder.AddCompletionQueue();
+  //std::unique_ptr<grpc::ServerCompletionQueue> infer_cq        = builder.AddCompletionQueue();
+  //std::unique_ptr<grpc::ServerCompletionQueue> stream_infer_cq = builder.AddCompletionQueue();
+  //std::unique_ptr<grpc::ServerCompletionQueue> modelcontrol_cq = builder.AddCompletionQueue();
+  //std::unique_ptr<grpc::ServerCompletionQueue> shmcontrol_cq   = builder.AddCompletionQueue();
+
   size_t vector_size_in_bytes  = sizeof(bigdata_t) * STREAMSIZE;
   size_t vector_size_out_bytes = sizeof(bigdata_t) * COMPSTREAMSIZE;
-  service.source_in.reserve(STREAMSIZE);
-  service.source_hw_results.reserve(COMPSTREAMSIZE);
+  // Allocate Memory in Host Memory
+  // When creating a buffer with user pointer (CL_MEM_USE_HOST_PTR), under the hood user ptr 
+  // is used if it is properly aligned. when not aligned, runtime had no choice but to create
+  // its own host side buffer. So it is recommended to use this allocator if user wish to
+  // create buffer using CL_MEM_USE_HOST_PTR to align user buffer to page boundary. It will 
+  // ensure that user buffer is used when user create Buffer/Mem object with CL_MEM_USE_HOST_PTR 
+
+  //initialize
+  service.source_in.reserve(STREAMSIZE*NUM_CU*NBUFFER);
+  service.source_hw_results.reserve(COMPSTREAMSIZE*NUM_CU*NBUFFER);
 
   std::vector<cl::Device> devices = xcl::get_xil_devices();
   cl::Device device = devices[0];
   devices.resize(1);
 
   cl::Context context(device);
-  cl::CommandQueue q_tmp(context, device, CL_QUEUE_PROFILING_ENABLE);
-  service.q = q_tmp;
-  std::string device_name = device.getInfo<CL_DEVICE_NAME>();
+  for (int ik = 0; ik < NUM_CU; ik++) {
+    cl::CommandQueue q_tmp(context, device,  CL_QUEUE_PROFILING_ENABLE | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE);
+    service.q.push_back(q_tmp);
+  }
+  std::string device_name = device.getInfo<CL_DEVICE_NAME>(); 
   std::cout << "Found Device=" << device_name.c_str() << std::endl;
 
   cl::Program::Binaries bins;
   // Load xclbin
-  std::cout << "Loading: '" << xclbinFilename << "'\n";
-  std::ifstream bin_file(xclbinFilename, std::ifstream::binary);
-  bin_file.seekg (0, bin_file.end);
-  unsigned nb = bin_file.tellg();
-  bin_file.seekg (0, bin_file.beg);
-  char *buf = new char [nb];
-  bin_file.read(buf, nb);
-  // Creating Program from Binary File
-  bins.push_back({buf,nb});
+  if (xclbinFilename != "") {
+    std::cout << "Loading: '" << xclbinFilename << "'\n";
+    std::ifstream bin_file(xclbinFilename, std::ifstream::binary);
+    bin_file.seekg (0, bin_file.end);
+    unsigned nb = bin_file.tellg();
+    bin_file.seekg (0, bin_file.beg);
+    char *buf = new char [nb];
+    bin_file.read(buf, nb);
+    
+    // Creating Program from Binary File
+    bins.push_back({buf,nb});
+  } else {
+    std::cout<<"No xclbin file specified, exiting..."<<std::endl;
+    return;
+  }
   cl::Program tmp_program(context, devices, bins);
   service.program = tmp_program;
-  cl::Kernel krnl_aws_hls4ml(service.program,"aws_hls4ml");
-  service.krnl_xil = krnl_aws_hls4ml;
-  // Allocate Buffer in Global Memory
-  // Buffers are allocated using CL_MEM_USE_HOST_PTR for efficient memory and 
-  // Device-to-host communication
-  cl::Buffer buffer_in    (context,CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY,   vector_size_in_bytes, service.source_in.data());
-  cl::Buffer buffer_output(context,CL_MEM_USE_HOST_PTR | CL_MEM_WRITE_ONLY, vector_size_out_bytes, service.source_hw_results.data());
-  service.inBufVec.clear();
-  service.outBufVec.clear();
-  service.inBufVec.push_back(buffer_in);
-  service.outBufVec.push_back(buffer_output);
+  for (int ib = 0; ib < NBUFFER; ib++) {
+    for (int ik = 0; ik < NUM_CU; ik++) {
+      std::string kernel_name = "aws_hls4ml:{aws_hls4ml_" + std::to_string(ik) + "}";
+      cl::Kernel krnl_aws_hls4ml(service.program,kernel_name.c_str());
+      service.krnl_xil.push_back(krnl_aws_hls4ml);
+    }
+  }
 
+  service.writeList.reserve(NUM_CU*NBUFFER);
+  service.kernList.reserve(NUM_CU*NBUFFER);
+  service.readList.reserve(NUM_CU*NBUFFER);
+  for (int ib = 0; ib < NBUFFER; ib++) {
+    for (int ik = 0; ik < NUM_CU; ik++) {
+      // Allocate Buffer in Global Memory
+      // Buffers are allocated using CL_MEM_USE_HOST_PTR for efficient memory and 
+      // Device-to-host communication
+      cl::Buffer buffer_in_tmp    (context,CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY,   vector_size_in_bytes, service.source_in.data()+((ib*NUM_CU+ik) * STREAMSIZE));
+      cl::Buffer buffer_out_tmp(context,CL_MEM_USE_HOST_PTR | CL_MEM_WRITE_ONLY, vector_size_out_bytes, service.source_hw_results.data()+((ib*NUM_CU+ik) * COMPSTREAMSIZE));
+      service.buffer_in.push_back(buffer_in_tmp);
+      service.buffer_out.push_back(buffer_out_tmp);
+  
+      cl::Event tmp_write = cl::Event();
+      cl::Event tmp_kern = cl::Event();
+      cl::Event tmp_read = cl::Event();
+      service.write_event.push_back(tmp_write);
+      service.kern_event.push_back(tmp_kern);
+      //service.read_event.push_back(tmp_read);
+  
+      int narg = 0;
+      service.krnl_xil[ib*NUM_CU+ik].setArg(narg++, service.buffer_in[ib*NUM_CU+ik]);
+      service.krnl_xil[ib*NUM_CU+ik].setArg(narg++, service.buffer_out[ib*NUM_CU+ik]);
+      service.isFirstRun.push_back(true);
+      std::vector<cl::Event> tmp_write_vec(1);
+      std::vector<cl::Event> tmp_kern_vec(1);
+      std::vector<cl::Event> tmp_read_vec(1);
+      service.writeList.push_back(tmp_write_vec);
+      service.kernList.push_back(tmp_kern_vec);
+      service.readList.push_back(tmp_read_vec);
+    }
+  }
 
-  int narg = 0;
-  service.krnl_xil.setArg(narg++, buffer_in);
-  service.krnl_xil.setArg(narg++, buffer_output);
-
-  ServerBuilder builder;
-  builder.AddListeningPort(address, grpc::InsecureServerCredentials());
-  builder.SetMaxMessageSize(1000000);
-  builder.RegisterService(&service);
+  service.ikern = 0;
   std::unique_ptr<Server> server(builder.BuildAndStart());
   std::cout << "Server listening on port: " << address << std::endl;
   int server_id=1;
