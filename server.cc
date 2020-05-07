@@ -19,8 +19,8 @@ typedef std::chrono::system_clock SClock;
 #include "request_status.grpc.pb.h"
 #include "model_config.pb.h"
 
-#define NBUFFER 4
-#define NUM_CU 1
+#define NBUFFER 8
+#define NUM_CU 3
 
 #include "kernel_params.h"
 
@@ -225,6 +225,7 @@ class GRPCServiceImplementation final : public nvidia::inferenceserver::GRPCServ
     char* lTVals = new char[batch_size*sizeof(data_t)];
     memcpy(&lTVals[0], source_hw_results.data()+(ikb*COMPSTREAMSIZE), (batch_size)*sizeof(data_t));
     outputs1->append(lTVals,(batch_size)*sizeof(data_t));
+    delete[] lTVals;
     auto ts1g = SClock::now();
     //print_nanoseconds("   finish  ",ts1g, ikb);
 
