@@ -8,10 +8,9 @@ LDFLAGS = -Wl,-rpath,/usr/local/lib\
 
 COMMON_REPO := ./hls4ml_c/
 
-include $(COMMON_REPO)/utility/boards.mk
 include $(COMMON_REPO)/libs/xcl2/xcl2.mk
 include $(COMMON_REPO)/libs/opencl/opencl.mk
-#include $(COMMON_REPO)/utility/rules.mk
+
 
 HLS4ML_PROJ_TYPE := DENSE
 
