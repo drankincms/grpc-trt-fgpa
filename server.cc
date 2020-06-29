@@ -20,7 +20,7 @@ typedef std::chrono::system_clock SClock;
 #include "model_config.pb.h"
 
 #define NBUFFER 8
-#define NUM_CU 1
+#define NUM_CU 3
 
 #include "kernel_params.h"
 
