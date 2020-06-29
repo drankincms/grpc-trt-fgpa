@@ -20,7 +20,7 @@ typedef std::chrono::system_clock SClock;
 #include "model_config.pb.h"
 
 #define NBUFFER 8
-#define NUM_CU 3
+#define NUM_CU 1
 
 #include "kernel_params.h"
 
@@ -141,6 +141,7 @@ class GRPCServiceImplementation final : public nvidia::inferenceserver::GRPCServ
 		     const InferRequest* request, 
 		     InferResponse* reply
 		     ) override {
+ 
     auto t0 = Clock::now();
     auto ikf = get_info_lock();
     int ikb = ikf.first;
@@ -185,7 +186,7 @@ class GRPCServiceImplementation final : public nvidia::inferenceserver::GRPCServ
     OCL_CHECK(err,
               err =
                   q[ik].enqueueMigrateMemObjects({buffer_in[ikb]},
-                                             0 /* 0 means from host*/,
+                                             0,
                                              NULL,
                                              &(write_event[ikb])));
     auto ts1c = SClock::now();
@@ -239,8 +240,7 @@ class GRPCServiceImplementation final : public nvidia::inferenceserver::GRPCServ
   } 
 };
 
-void Run(std::string xclbinFilename) {
-  std::string address("0.0.0.0:8443");
+void Run(std::string xclbinFilename, std::string address, int cu_shift) {
   GRPCServiceImplementation service;
 
   ServerBuilder builder;
@@ -302,7 +302,7 @@ void Run(std::string xclbinFilename) {
   service.program = tmp_program;
   for (int ib = 0; ib < NBUFFER; ib++) {
     for (int ik = 0; ik < NUM_CU; ik++) {
-      std::string kernel_name = "aws_hls4ml:{aws_hls4ml_" + std::to_string(ik) + "}";
+      std::string kernel_name = "aws_hls4ml:{aws_hls4ml_" + std::to_string(ik+cu_shift) + "}";
       cl::Kernel krnl_aws_hls4ml(service.program,kernel_name.c_str());
       service.krnl_xil.push_back(krnl_aws_hls4ml);
     }
@@ -351,8 +351,12 @@ void Run(std::string xclbinFilename) {
 int main(int argc, char** argv) {
 
   std::string xclbinFilename = "";
+  std::string address("0.0.0.0:8443");
+  int cu_shift = 0;
   if (argc>1) xclbinFilename = argv[1];
-  Run(xclbinFilename);
+  if (argc>2) address = "0.0.0.0:"+std::string(argv[2]);
+  if (argc>3) cu_shift = std::atoi(argv[3]);
+  Run(xclbinFilename,address,cu_shift);
 
   return 0;
 }
