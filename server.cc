@@ -8,6 +8,7 @@
 #include <chrono>
 #include <ctime>
 #include <iomanip>
+#include <thread>
 typedef std::chrono::high_resolution_clock Clock;
 typedef std::chrono::system_clock SClock;
 
@@ -19,10 +20,10 @@ typedef std::chrono::system_clock SClock;
 #include "request_status.grpc.pb.h"
 #include "model_config.pb.h"
 
-#define NBUFFER 8
-#define NUM_CU 3
-
 #include "kernel_params.h"
+
+#define NUM_CU 3
+#define NBUFFER 8
 
 using grpc::Server;
 using grpc::ServerBuilder;
