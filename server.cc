@@ -241,6 +241,10 @@ class GRPCServiceImplementation final : public nvidia::inferenceserver::GRPCServ
   } 
 };
 
+void runWait(std::unique_ptr<Server> srv) {
+    srv->Wait();
+}
+
 void Run(std::string xclbinFilename, int port, unsigned int num_servers) {
   GRPCServiceImplementation service;
 
